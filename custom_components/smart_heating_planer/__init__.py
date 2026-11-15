@@ -7,6 +7,11 @@ eingetragen werden. Der Plan selbst liegt im Thermostat (Zigbee2MQTT-Entities
 
 Zusätzlich verwaltet die Integration Bedingungen (siehe ``conditions.py``):
 Entity-Zustand → Thermostat auf Manuell/Aus, optional Boost, optional zurücksetzen.
+
+Und Kopplungen (siehe ``couplings.py``): zwei Thermostate "mit Gruppe" zu einer
+eigenen climate-Entity zusammenfassen, die überall in Home Assistant nutzbar ist.
+Die Kopplung "ohne Gruppe" (zweites Thermostat nur in der Karte mitgeführt)
+braucht dagegen keine Integrations-Logik, das steckt komplett in der Karte.
 """
 
 from __future__ import annotations
@@ -22,9 +27,12 @@ from homeassistant.helpers import config_validation as cv
 from . import websocket
 from .conditions import ConditionManager
 from .const import CARD_URL, CARD_URL_BASE, DOMAIN, VERSION
-from .websocket import DATA_MANAGER
+from .couplings import CouplingManager
+from .websocket import DATA_COUPLINGS, DATA_MANAGER
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+PLATFORMS = ["climate"]
 
 _FRONTEND_DIR = Path(__file__).parent / "frontend"
 _STATIC_REGISTERED = f"{DOMAIN}_static_registered"
@@ -49,13 +57,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     manager = ConditionManager(hass)
     await manager.async_load()
     hass.data[DATA_MANAGER] = manager
+    # CouplingManager wird erst nutzbar, sobald die climate-Plattform ihre
+    # async_add_entities-Funktion über manager.bind() hinterlegt hat.
+    hass.data[DATA_COUPLINGS] = CouplingManager(hass)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     add_extra_js_url(hass, _versioned_url())
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     remove_extra_js_url(hass, _versioned_url())
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     manager = hass.data.pop(DATA_MANAGER, None)
     if manager:
         manager.async_unload()
-    return True
+    couplings = hass.data.pop(DATA_COUPLINGS, None)
+    if couplings:
+        couplings.async_unload()
+    return unloaded

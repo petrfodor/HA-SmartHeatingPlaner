@@ -57,6 +57,19 @@ Mit Bedingungen reagiert das Thermostat auf andere Geräte, ohne dass man eine A
 
 Ausgewertet werden die Bedingungen in der Integration selbst, also auch wenn keine Karte geöffnet ist und nach einem Neustart von Home Assistant. Gespeichert sind sie in `.storage/smart_heating_planer.conditions`. Zustände wie `unavailable` oder `unknown` lösen nichts aus. Gelten mehrere Bedingungen für dasselbe Thermostat, gewinnt die zuletzt erfüllte, und zurückgesetzt wird erst, wenn keine mehr erfüllt ist. Ändert man während einer aktiven Bedingung von Hand etwas am Thermostat, wird das beim Zurücksetzen überschrieben. Anlegen und Ändern dürfen nur Administratoren.
 
+**Zwei Thermostate koppeln (ab 1.4.0)**
+
+Zwei Thermostate, die immer dieselbe Temperatur/denselben Modus/denselben Wochenplan bekommen sollen (z. B. zwei Heizkörper im selben Raum), lassen sich auf zwei Arten koppeln:
+
+| | Ohne Gruppe | Mit Gruppe |
+|---|---|---|
+| Einrichtung | Zweites Thermostat im Karten-Editor (`entity2`) | Abschnitt „Thermostat-Gruppen“ unterhalb des Wochenplans |
+| Neue Entity? | Nein | Ja, eine eigene `climate.*`-Entity |
+| Nutzbar außerhalb dieser Karte? | Nein, nur in dieser Karte | Ja – andere Dashboards, Automationen, Google Home/Alexa |
+| Löschen | Config-Option entfernen | Mülleimer bei der Gruppe (löscht nur die Gruppen-Entity, beide Thermostate bleiben) |
+
+In beiden Fällen gilt: Temperatur, Modus und Boost gehen an beide Thermostate gleichzeitig, der Wochenplan wird beim Speichern an beide geschrieben (jeweils passend zu deren eigenem Profil zugeschnitten). Angezeigt wird immer der Zustand des ersten Thermostats bzw. – bei „mit Gruppe“ – der aus beiden zusammengefasste Zustand (gleich: übernehmen, unterschiedlich: Wert des ersten). Ein kleines 🔗-Symbol neben dem Namen zeigt, mit welchem Thermostat gekoppelt ist. Voraussetzung: Beide Thermostate müssen die Wochenplan-Text-Entities im gleichen Format bereitstellen (siehe Tabelle unten) – sonst wird nur Temperatur/Modus/Boost mitgekoppelt, nicht der Plan.
+
 ## Kompatible Thermostate
 
 Die Karte braucht ein Thermostat, das über **Zigbee2MQTT** angebunden ist und seinen Wochenplan als Text-Entities `text.<name>_weekly_schedule_<tag>` im Format `HH:MM/Temperatur` bereitstellt. Die Grenzen pro Modell (Anzahl Schaltpunkte, Temperaturbereich) erkennt die Karte automatisch über das Modell in der Geräte-Registry.
@@ -103,6 +116,7 @@ Dashboard bearbeiten → Karte hinzufügen → „Smart Heating Planer“ suchen
 ```yaml
 type: custom:smart-heating-planer-card          # oder custom:smart-heating-planer-compact-card
 entity: climate.heizung
+entity2: climate.heizung_2                      # optional, Kopplung "ohne Gruppe" (siehe oben)
 name: Wohnzimmer                                # optional
 max_slots: 6                                    # optional, nur für Thermostate, die die Karte nicht kennt
 boost_entity: switch.heizung_boost_heating      # optional, sonst automatisch

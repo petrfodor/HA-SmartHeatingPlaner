@@ -15,9 +15,19 @@
  * Bedingungen (ab 1.3.0): "Wenn Entity X = Wert, dann Manuell/Aus, optional Boost,
  * optional zurücksetzen". Ausgewertet werden sie in der Integration (conditions.py),
  * die Karte bearbeitet sie nur über die Websocket-API smart_heating_planer/conditions/*.
+ *
+ * Zwei Thermostate koppeln (ab 1.4.0), zwei Varianten:
+ *  - "Ohne Gruppe": im Karten-Editor ein zweites Thermostat (entity2) angeben.
+ *    Reine Karten-Logik, keine neue Entity – Temperatur/Modus/Boost/Wochenplan
+ *    gehen an beide Thermostate, angezeigt wird der Zustand des ersten.
+ *  - "Mit Gruppe": Abschnitt "Thermostat-Gruppen" unten in der Karte, legt über
+ *    die Integration (couplings.py) eine echte climate-Entity an, die beide
+ *    Thermostate zusammenfasst (Attribut smart_heating_planer_group) – nutzbar
+ *    überall in Home Assistant, nicht nur in dieser Karte. Zeigt man damit als
+ *    "entity" in dieser Karte an, löst die Karte die Mitglieder automatisch auf.
  */
 
-const VERSION = "1.3.1";
+const VERSION = "1.4.0";
 
 const DAYS = [
   { key: "monday", short: "Mo", long: "Montag" },
@@ -156,6 +166,10 @@ class SmartHeatingPlanerCard extends HTMLElement {
     this._ruleDraft = null;
     this._condMessage = null;
     this._condBusy = false;
+    this._couplings = null; // null = Integration liefert (noch) keine Gruppen
+    this._couplingDraft = null;
+    this._couplingMessage = null;
+    this._couplingBusy = false;
     this.shadowRoot.addEventListener("click", (ev) => this._onClick(ev));
     // Nicht neu zeichnen, solange ein Finger auf der Karte liegt – sonst wird der Knopf
     // zwischen Antippen und Loslassen ersetzt und der Tipp geht verloren
@@ -185,6 +199,9 @@ class SmartHeatingPlanerCard extends HTMLElement {
     if (!config || !config.entity || !String(config.entity).startsWith("climate.")) {
       throw new Error("Bitte ein Thermostat (climate.*) als entity angeben");
     }
+    if (config.entity2 && (!String(config.entity2).startsWith("climate.") || config.entity2 === config.entity)) {
+      throw new Error("entity2 muss ein anderes Thermostat (climate.*) sein");
+    }
     this._config = { ...config };
     this._watchKey = null;
     if (this._hass) this._render();
@@ -192,15 +209,18 @@ class SmartHeatingPlanerCard extends HTMLElement {
 
   connectedCallback() {
     this._subscribeConditions();
+    this._subscribeCouplings();
   }
 
   disconnectedCallback() {
     this._unsubscribeConditions();
+    this._unsubscribeCouplings();
   }
 
   set hass(hass) {
     this._hass = hass;
     this._subscribeConditions();
+    this._subscribeCouplings();
     if (!this._config) return;
     this._entities = this._findEntities();
     this._expireSavedDrafts();
@@ -224,15 +244,44 @@ class SmartHeatingPlanerCard extends HTMLElement {
 
   // ---------- Entities ----------
 
+  // Gekoppelt: "mit Gruppe" (echte climate-Gruppen-Entity, Mitglieder über ihr
+  // Attribut entity_id) oder "ohne Gruppe" (entity2 im Karten-Editor). In beiden
+  // Fällen zeigt die Karte den Zustand des ersten Mitglieds an, Wochenplan/Boost
+  // gehen an alle Mitglieder, Thermostat-Befehle an controlTargets.
   _findEntities() {
     const hass = this._hass;
     const climate = this._config.entity;
+    const groupState = hass.states[climate];
+    const isGroup = !!groupState?.attributes?.smart_heating_planer_group;
+    const realMembers = isGroup
+      ? (groupState.attributes.entity_id || []).slice(0, 2)
+      : [climate, ...(this._config.entity2 ? [this._config.entity2] : [])];
+    const members = (realMembers.length ? realMembers : [climate]).map((id) => this._resolveMember(id));
+    const primary = members[0];
+    return {
+      climate,
+      isGroup,
+      coupled: members.length > 1,
+      controlTargets: isGroup ? [climate] : members.map((m) => m.climate),
+      members,
+      days: primary.days,
+      activeGroup: primary.activeGroup,
+      editGroup: primary.editGroup,
+      model: primary.model,
+      profile: primary.profile,
+      boost: primary.boost,
+      boostCountdown: primary.boostCountdown,
+    };
+  }
+
+  _resolveMember(climate) {
+    const hass = this._hass;
     const out = { climate, days: {}, activeGroup: null, editGroup: null };
     const registry = hass.entities || {};
     const deviceId = registry[climate]?.device_id;
     const model = (deviceId && hass.devices?.[deviceId]?.model_id) || null;
     const profile = { ...(PROFILES[model] || DEFAULT_PROFILE) };
-    if (Number(this._config.max_slots) > 0) profile.maxSlots = Number(this._config.max_slots);
+    if (climate === this._config.entity && Number(this._config.max_slots) > 0) profile.maxSlots = Number(this._config.max_slots);
     out.model = model;
     out.profile = profile;
     if (deviceId) {
@@ -262,15 +311,15 @@ class SmartHeatingPlanerCard extends HTMLElement {
       out.boostSelect = `select.${objectId}_temporary_mode_mode`;
     if (!out.boostCountdown && hass.states[`sensor.${objectId}_boost_heating_countdown`])
       out.boostCountdown = `sensor.${objectId}_boost_heating_countdown`;
-    out.boost = this._resolveBoost(out);
+    out.boost = this._resolveBoost(out, climate === this._config.entity);
     return out;
   }
 
   // Boost je nach Thermostat: Schalter (Moes, Bosch …), Auswahl "temporary mode" (Sonoff) oder Preset "boost"
-  _resolveBoost(e) {
+  _resolveBoost(e, isPrimary) {
     const states = this._hass.states;
     const hasBoostOption = (id) => (states[id]?.attributes?.options || []).includes("boost");
-    const forced = this._config.boost_entity;
+    const forced = isPrimary ? this._config.boost_entity : null;
     if (forced) {
       if (forced.startsWith("select.")) return hasBoostOption(forced) ? { kind: "select", id: forced } : null;
       if (/^(switch|input_boolean)\./.test(forced)) return { kind: "switch", id: forced };
@@ -284,7 +333,8 @@ class SmartHeatingPlanerCard extends HTMLElement {
 
   _computeWatchKey() {
     const e = this._entities;
-    const ids = [e.climate, ...Object.values(e.days), e.activeGroup, e.editGroup, e.boost?.id, e.boostCountdown].filter(Boolean);
+    const memberIds = e.members.flatMap((m) => [m.climate, ...Object.values(m.days), m.activeGroup, m.editGroup, m.boost?.id, m.boostCountdown]);
+    const ids = [...new Set([e.climate, ...memberIds].filter(Boolean))];
     return ids.map((id) => this._hass.states[id]?.last_updated ?? "-").join("|") + `|${new Date().getMinutes()}`;
   }
 
@@ -362,7 +412,7 @@ class SmartHeatingPlanerCard extends HTMLElement {
     clearTimeout(this._targetTimer);
     // Mehrfaches Tippen sammeln, damit das batteriebetriebene Thermostat nur einen Befehl bekommt
     this._targetTimer = setTimeout(() => {
-      this._call("climate", "set_temperature", { entity_id: this._config.entity, temperature: next }).catch((err) =>
+      this._call("climate", "set_temperature", { entity_id: this._entities.controlTargets, temperature: next }).catch((err) =>
         this._showError(err),
       );
     }, TARGET_DEBOUNCE_MS);
@@ -371,7 +421,7 @@ class SmartHeatingPlanerCard extends HTMLElement {
 
   async _setHvacMode(mode) {
     try {
-      await this._call("climate", "set_hvac_mode", { entity_id: this._config.entity, hvac_mode: mode });
+      await this._call("climate", "set_hvac_mode", { entity_id: this._entities.controlTargets, hvac_mode: mode });
     } catch (err) {
       this._showError(err);
     }
@@ -464,22 +514,28 @@ class SmartHeatingPlanerCard extends HTMLElement {
     clearTimeout(this._boostTimer);
     this._boostTimer = setTimeout(() => this._render(), BOOST_TIMEOUT_MS + 100);
     try {
-      if (b.kind === "switch") {
-        await this._call(b.id.split(".")[0], on ? "turn_on" : "turn_off", { entity_id: b.id });
-      } else if (b.kind === "select") {
-        const options = this._hass.states[b.id]?.attributes?.options || [];
-        const off = options.includes("disabled") ? "disabled" : options.find((o) => o !== "boost");
-        await this._call("select", "select_option", { entity_id: b.id, option: on ? "boost" : off });
-      } else {
-        const a = this._hass.states[b.id]?.attributes || {};
-        const presets = a.preset_modes || [];
-        if (on && a.preset_mode && a.preset_mode !== "boost") this._presetBeforeBoost = a.preset_mode;
-        const back = [this._presetBeforeBoost, ...PRESET_FALLBACKS].find((m) => m && presets.includes(m)) || presets.find((m) => m !== "boost");
-        await this._call("climate", "set_preset_mode", { entity_id: b.id, preset_mode: on ? "boost" : back });
-      }
+      // Gekoppelt: Boost an allen Mitgliedern mit eigener Boost-Entity umschalten
+      await Promise.all(this._entities.members.map((m) => this._setMemberBoost(m.boost, on)));
     } catch (err) {
       this._pendingBoost = null;
       this._showError(err);
+    }
+  }
+
+  async _setMemberBoost(b, on) {
+    if (!b) return;
+    if (b.kind === "switch") {
+      await this._call(b.id.split(".")[0], on ? "turn_on" : "turn_off", { entity_id: b.id });
+    } else if (b.kind === "select") {
+      const options = this._hass.states[b.id]?.attributes?.options || [];
+      const off = options.includes("disabled") ? "disabled" : options.find((o) => o !== "boost");
+      await this._call("select", "select_option", { entity_id: b.id, option: on ? "boost" : off });
+    } else {
+      const a = this._hass.states[b.id]?.attributes || {};
+      const presets = a.preset_modes || [];
+      if (on && a.preset_mode && a.preset_mode !== "boost") this._presetBeforeBoost = a.preset_mode;
+      const back = [this._presetBeforeBoost, ...PRESET_FALLBACKS].find((m) => m && presets.includes(m)) || presets.find((m) => m !== "boost");
+      await this._call("climate", "set_preset_mode", { entity_id: b.id, preset_mode: on ? "boost" : back });
     }
   }
 
@@ -509,6 +565,90 @@ class SmartHeatingPlanerCard extends HTMLElement {
     const sub = this._condSub;
     this._condSub = null;
     sub?.then((unsub) => unsub && unsub()).catch(() => {});
+  }
+
+  // ---------- Thermostat-Gruppen ("mit Gruppe") ----------
+
+  _subscribeCouplings() {
+    if (this._coupSub || !this._hass?.connection || !this.isConnected) return;
+    this._coupSub = this._hass.connection
+      .subscribeMessage(
+        (msg) => {
+          this._couplings = msg.couplings || [];
+          this._render();
+        },
+        { type: "smart_heating_planer/couplings/subscribe" },
+      )
+      .catch(() => {
+        // Ältere Integration ohne Gruppen: Abschnitt einfach weglassen
+        this._coupSub = null;
+        this._couplings = null;
+        return null;
+      });
+  }
+
+  _unsubscribeCouplings() {
+    const sub = this._coupSub;
+    this._coupSub = null;
+    sub?.then((unsub) => unsub && unsub()).catch(() => {});
+  }
+
+  async _saveCoupling() {
+    const d = this._couplingDraft;
+    if (!d.members[0] || !d.members[1]) {
+      this._couplingMessage = { text: "Bitte beide Thermostate wählen.", error: true };
+      return this._render();
+    }
+    this._couplingBusy = true;
+    this._couplingMessage = null;
+    this._render();
+    try {
+      await this._hass.callWS({ type: "smart_heating_planer/couplings/save", coupling: d });
+      this._couplingDraft = null;
+    } catch (err) {
+      this._couplingMessage = { text: `Fehler: ${err?.message || err}`, error: true };
+    }
+    this._couplingBusy = false;
+    this._render();
+  }
+
+  async _deleteCoupling(id) {
+    if (!confirm("Diese Gruppe löschen? Die climate-Entity wird entfernt, beide Thermostate bleiben erhalten.")) return;
+    this._couplingBusy = true;
+    this._render();
+    try {
+      await this._hass.callWS({ type: "smart_heating_planer/couplings/delete", coupling_id: id });
+    } catch (err) {
+      this._couplingMessage = { text: `Fehler: ${err?.message || err}`, error: true };
+    }
+    this._couplingBusy = false;
+    this._render();
+  }
+
+  _onCouplingClick(action, value) {
+    switch (action) {
+      case "g-add":
+        this._couplingDraft = { id: null, name: "", members: [null, null] };
+        this._couplingMessage = null;
+        break;
+      case "g-cancel":
+        this._couplingDraft = null;
+        this._couplingMessage = null;
+        break;
+      case "g-save":
+        return this._saveCoupling();
+      case "g-delete":
+        return this._deleteCoupling(value);
+      default:
+        return;
+    }
+    this._render();
+  }
+
+  _couplingTooltip() {
+    const other = this._entities.members.find((m) => m.climate !== this._config.entity);
+    if (this._entities.isGroup) return `Gruppe aus ${this._entities.members.map((m) => this._entityName(m.climate)).join(" + ")}`;
+    return `Gekoppelt mit ${this._entityName(other?.climate)}`;
   }
 
   _myRules() {
@@ -781,13 +921,17 @@ class SmartHeatingPlanerCard extends HTMLElement {
     this._render();
     try {
       for (const day of days) {
-        const entity = this._entities.days[day];
         const draft = this._drafts[day];
-        await this._call("text", "set_value", { entity_id: entity, value: serializeSchedule(draft.slots, this._entities.profile) });
+        // Gekoppelt: derselbe Plan geht an jedes Mitglied, jeweils passend zu dessen Profil serialisiert
+        for (const member of this._entities.members) {
+          const entity = member.days[day];
+          if (!entity) continue;
+          await this._call("text", "set_value", { entity_id: entity, value: serializeSchedule(draft.slots, member.profile) });
+          // Kleine Pause, damit das Thermostat die Befehle nacheinander verarbeitet
+          await new Promise((r) => setTimeout(r, 300));
+        }
         draft.saved = true;
         draft.savedAt = Date.now();
-        // Kleine Pause, damit das Thermostat die Befehle nacheinander verarbeitet
-        await new Promise((r) => setTimeout(r, 300));
       }
       this._message = { text: `Gespeichert (${days.length} ${days.length === 1 ? "Tag" : "Tage"}).` };
     } catch (err) {
@@ -816,6 +960,7 @@ class SmartHeatingPlanerCard extends HTMLElement {
     const { action, value } = el.dataset;
     const index = Number(el.dataset.index);
     if (action.startsWith("c-")) return this._onCondClick(action, value);
+    if (action.startsWith("g-")) return this._onCouplingClick(action, value);
     switch (action) {
       case "target-down": return this._changeTarget(-1);
       case "target-up": return this._changeTarget(1);
@@ -863,6 +1008,14 @@ class SmartHeatingPlanerCard extends HTMLElement {
     } else if (el.dataset.action === "c-input" && this._ruleDraft) {
       this._ruleDraft.value = el.value.trim();
       this._render();
+    } else if (el.dataset.action === "g-member1" && this._couplingDraft) {
+      this._couplingDraft.members[0] = el.value;
+      this._render();
+    } else if (el.dataset.action === "g-member2" && this._couplingDraft) {
+      this._couplingDraft.members[1] = el.value;
+      this._render();
+    } else if (el.dataset.action === "g-name" && this._couplingDraft) {
+      this._couplingDraft.name = el.value.trim();
     }
   }
 
@@ -885,7 +1038,7 @@ class SmartHeatingPlanerCard extends HTMLElement {
     const st = this._hass.states[this._config.entity];
     const html = st
       ? `${STYLE}<ha-card class="${this._compact ? "compact" : ""}">${this._renderThermostat(st)}${
-          this._compact ? this._renderMessage() : this._renderPlanner() + this._renderConditions()
+          this._compact ? this._renderMessage() : this._renderPlanner() + this._renderConditions() + this._renderCouplingsSection()
         }</ha-card>`
       : `${STYLE}<ha-card><div class="warn">Entity ${esc(this._config.entity)} nicht gefunden.</div></ha-card>`;
     // Unveränderte Karte nicht neu aufbauen (Thermostat meldet sich oft mehrmals pro Sekunde)
@@ -909,6 +1062,7 @@ class SmartHeatingPlanerCard extends HTMLElement {
         <button class="title" data-action="more-info" title="Details">
           <ha-icon icon="mdi:radiator"></ha-icon>
           <span>${esc(name)}</span>
+          ${this._entities.coupled ? `<ha-icon class="link-icon" icon="mdi:link-variant" title="${esc(this._couplingTooltip())}"></ha-icon>` : ""}
         </button>
         <span class="badge ${esc(action || st.state)}">${esc(ACTION_LABELS[action] || (unavailable ? "Nicht erreichbar" : st.state))}</span>
       </div>
@@ -1155,6 +1309,77 @@ class SmartHeatingPlanerCard extends HTMLElement {
     `;
   }
 
+  _renderCouplingsSection() {
+    if (this._couplings === null) return "";
+    const d = this._couplingDraft;
+    const msg = this._couplingMessage
+      ? `<div class="msg ${this._couplingMessage.error ? "error" : ""}">${esc(this._couplingMessage.text)}</div>`
+      : "";
+    return `
+      <div class="section-title">Thermostat-Gruppen</div>
+      ${
+        this._couplings.length
+          ? `<div class="rules">${this._couplings.map((c) => this._renderCoupling(c)).join("")}</div>`
+          : d
+            ? ""
+            : `<div class="warn">Zwei Thermostate "mit Gruppe" zu einer gemeinsamen climate-Entity zusammenfassen – nutzbar auch in anderen Karten, bei Google Home/Alexa usw. Für eine Kopplung "ohne Gruppe" reicht ein zweites Thermostat (entity2) im Karten-Editor dieser Karte.</div>`
+      }
+      ${
+        d
+          ? this._renderCouplingEditor(d)
+          : `<button class="ghost" data-action="g-add"><ha-icon icon="mdi:link-variant-plus"></ha-icon>Gruppe</button>`
+      }
+      ${msg}
+    `;
+  }
+
+  _renderCoupling(c) {
+    const [a, b] = c.members;
+    return `
+      <div class="rule">
+        <div class="rule-main">
+          <span class="rule-when"><ha-icon icon="mdi:link-variant"></ha-icon>${esc(c.name)}</span>
+          <span class="rule-then">${esc(this._entityName(a))} ↔ ${esc(this._entityName(b))}${
+            c.entity_id ? ` · ${esc(c.entity_id)}` : " · wird angelegt …"
+          }</span>
+        </div>
+        <button class="ghost del-btn" data-action="g-delete" data-value="${esc(c.id)}" ${this._couplingBusy ? "disabled" : ""} aria-label="Löschen">
+          <ha-icon icon="mdi:delete-outline"></ha-icon></button>
+      </div>
+    `;
+  }
+
+  _renderCouplingEditor(d) {
+    const options = Object.keys(this._hass.states)
+      .filter((id) => id.startsWith("climate.") && !this._hass.states[id].attributes.smart_heating_planer_group)
+      .sort((a, b) => this._entityName(a).localeCompare(this._entityName(b), "de"));
+    const opt = (selected, otherValue) =>
+      options
+        .filter((id) => id !== otherValue)
+        .map((id) => `<option value="${esc(id)}" ${id === selected ? "selected" : ""}>${esc(this._entityName(id))}</option>`)
+        .join("");
+    return `
+      <div class="editor">
+        <div class="ed-label">Name</div>
+        <input class="field" type="text" data-action="g-name" value="${esc(d.name)}" placeholder="z. B. Heizung + Bad" aria-label="Name">
+        <div class="ed-label">Thermostat 1</div>
+        <select class="field" data-action="g-member1" aria-label="Thermostat 1">
+          ${d.members[0] ? "" : `<option value="" selected disabled>wählen …</option>`}
+          ${opt(d.members[0], d.members[1])}
+        </select>
+        <div class="ed-label">Thermostat 2</div>
+        <select class="field" data-action="g-member2" aria-label="Thermostat 2">
+          ${d.members[1] ? "" : `<option value="" selected disabled>wählen …</option>`}
+          ${opt(d.members[1], d.members[0])}
+        </select>
+        <div class="savebar static">
+          <button class="ghost" data-action="g-cancel" ${this._couplingBusy ? "disabled" : ""}>Abbrechen</button>
+          <button class="primary" data-action="g-save" ${this._couplingBusy ? "disabled" : ""}>${this._couplingBusy ? "Speichert …" : "Anlegen"}</button>
+        </div>
+      </div>
+    `;
+  }
+
   _renderPrograms() {
     const { activeGroup, editGroup } = this._entities;
     const active = activeGroup && this._hass.states[activeGroup];
@@ -1257,6 +1482,7 @@ const STYLE = `<style>
   .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .title { display: flex; align-items: center; gap: 10px; font-size: 1.2rem; font-weight: 500; padding: 4px 0; text-align: left; }
   .title ha-icon { color: var(--state-climate-heat-color, #ff8100); }
+  .title .link-icon { --mdc-icon-size: 16px; color: var(--secondary-text-color); margin-left: -4px; }
   .badge { font-size: .85rem; padding: 4px 12px; border-radius: 999px; background: var(--secondary-background-color); color: var(--secondary-text-color); white-space: nowrap; }
   .badge.heating, .badge.preheating { background: rgba(255,129,0,.18); color: var(--state-climate-heat-color, #ff8100); }
   .thermo { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0; }
@@ -1378,6 +1604,7 @@ class SmartHeatingPlanerCardEditor extends HTMLElement {
       this._form = document.createElement("ha-form");
       this._form.schema = [
         { name: "entity", required: true, selector: { entity: { domain: "climate" } } },
+        { name: "entity2", selector: { entity: { domain: "climate" } } },
         { name: "name", selector: { text: {} } },
         { name: "max_slots", selector: { number: { min: 1, max: 12, mode: "box" } } },
         { name: "boost_entity", selector: { entity: { domain: ["switch", "select", "input_boolean"] } } },
@@ -1385,6 +1612,7 @@ class SmartHeatingPlanerCardEditor extends HTMLElement {
       this._form.computeLabel = (s) =>
         ({
           entity: "Thermostat",
+          entity2: "Zweites Thermostat (optional, ohne Gruppe gekoppelt)",
           name: "Name (optional)",
           max_slots: "Max. Schaltpunkte pro Tag (optional, sonst automatisch)",
           boost_entity: "Boost-Entity (optional, sonst automatisch)",
@@ -1392,6 +1620,7 @@ class SmartHeatingPlanerCardEditor extends HTMLElement {
       this._form.addEventListener("value-changed", (ev) => {
         const config = { ...this._config, ...ev.detail.value };
         if (!config.name) delete config.name;
+        if (!config.entity2) delete config.entity2;
         if (!config.max_slots) delete config.max_slots;
         if (!config.boost_entity) delete config.boost_entity;
         this._config = config;
