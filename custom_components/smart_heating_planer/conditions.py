@@ -162,7 +162,12 @@ class ConditionManager:
         if self._unsub_track:
             self._unsub_track()
             self._unsub_track = None
-        entities = sorted({r["entity"] for r in self.rules if r.get("enabled", True)})
+        # Auslöser-Entities der Regeln UND die Thermostate aktiver Bedingungen – letztere,
+        # damit ein manuelles Übersteuern während einer aktiven Bedingung sofort erkannt
+        # und zurückgeschaltet wird, statt bis zum nächsten Auslöser-Wechsel zu warten.
+        entities = sorted(
+            {r["entity"] for r in self.rules if r.get("enabled", True)} | set(self._active.keys())
+        )
         if entities:
             self._unsub_track = async_track_state_change_event(self.hass, entities, self._on_state)
 
@@ -206,6 +211,7 @@ class ConditionManager:
             if not self._active[climate]:
                 self._active.pop(climate)
                 self._snapshots.pop(climate, None)
+        self._track()
         for rule in list(self.rules):
             await self._evaluate(rule)
 
@@ -215,6 +221,22 @@ class ConditionManager:
         for rule in self.rules:
             if rule["entity"] == entity_id:
                 self.hass.async_create_task(self._evaluate(rule))
+        if entity_id in self._active:
+            self.hass.async_create_task(self._enforce(entity_id))
+
+    async def _enforce(self, climate: str) -> None:
+        """Erzwingt die zuletzt aktivierte Bedingung erneut, falls sie manuell übersteuert wurde.
+
+        _apply() ändert nur, was tatsächlich abweicht – ist der Zustand schon korrekt
+        (z. B. weil dieser Aufruf selbst die Änderung ausgelöst hat), passiert nichts,
+        die Kette bricht also sofort ab.
+        """
+        ids = self._active.get(climate)
+        if not ids:
+            return
+        rule = next((r for r in self.rules if r["id"] == ids[-1]), None)
+        if rule:
+            await self._apply(rule)
 
     async def _evaluate(self, rule: dict[str, Any], reapply: bool = False) -> None:
         active = self._is_active(rule)
@@ -238,6 +260,7 @@ class ConditionManager:
         if not self._active.get(climate):
             self._snapshots[climate] = self._snapshot(climate)
         self._active.setdefault(climate, []).append(rule["id"])
+        self._track()
         self._save()
         _LOGGER.info("Bedingung %s erfüllt (%s) – schalte %s", rule["id"], rule["entity"], climate)
         await self._apply(rule)
@@ -252,6 +275,7 @@ class ConditionManager:
         if not ids:
             self._active.pop(climate, None)
             self._snapshots.pop(climate, None)
+            self._track()
         self._save()
         if remaining:
             # Eine andere Bedingung für dasselbe Thermostat gilt noch – die übernimmt
@@ -291,7 +315,7 @@ class ConditionManager:
         hvac_modes = st.attributes.get("hvac_modes") or []
         presets = st.attributes.get("preset_modes") or []
         if rule["mode"] == "off":
-            if "off" in hvac_modes:
+            if "off" in hvac_modes and st.state != "off":
                 await self._call("climate", "set_hvac_mode", {"entity_id": climate, "hvac_mode": "off"})
             return
         # Manuell: Moes & Co. über Preset "manual", Sonoff & Co. über hvac_mode "heat"
@@ -300,7 +324,7 @@ class ConditionManager:
                 await self._call("climate", "set_preset_mode", {"entity_id": climate, "preset_mode": "manual"})
         elif "heat" in hvac_modes and st.state != "heat":
             await self._call("climate", "set_hvac_mode", {"entity_id": climate, "hvac_mode": "heat"})
-        if rule.get("temperature") is not None:
+        if rule.get("temperature") is not None and st.attributes.get("temperature") != rule["temperature"]:
             await self._call("climate", "set_temperature", {"entity_id": climate, "temperature": rule["temperature"]})
         if rule.get("boost"):
             await self._set_boost(climate, True)
