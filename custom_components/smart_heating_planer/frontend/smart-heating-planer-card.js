@@ -27,14 +27,15 @@
  *    "entity" in this card, the card resolves the members automatically.
  */
 
-const VERSION = "1.4.0";
+const VERSION = "1.4.2";
 
 // ---------- Translations ----------
-// Texts live in translations/<language>.json ("card" section) and are loaded at runtime.
+// Texts live in translations/card/<language>.json and are loaded at runtime
+// (kept out of translations/<language>.json, which is reserved for the HA config flow).
 // The language follows hass.language; English is used when no matching file exists.
-const I18N_BASE = "/smart_heating_planer_translations";
+const I18N_BASE = "/smart_heating_planer_translations/card";
 const SUPPORTED_LANGS = ["en", "de", "cs", "sk", "pl", "fr"];
-const DICTS = {}; // sprache → {key: text}; null = Laden fehlgeschlagen
+const DICTS = {}; // language → {key: text}; null = loading failed
 const LOADING = {};
 let LANG = "en";
 
@@ -42,7 +43,7 @@ function loadLang(lang) {
   if (!(lang in LOADING)) {
     LOADING[lang] = fetch(`${I18N_BASE}/${lang}.json?v=${VERSION}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(r.statusText))))
-      .then((json) => (DICTS[lang] = json.card || {}))
+      .then((json) => (DICTS[lang] = json))
       .catch(() => (DICTS[lang] = null));
   }
   return LOADING[lang];
